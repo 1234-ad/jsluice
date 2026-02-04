@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/ditashi/jsbeautifier-go/jsbeautifier"
-	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/smacker/go-tree-sitter/javascript"
+	tree_sitter "github.com/tree-sitter/go-tree-sitter"
+	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
 )
 
 // ExpressionPlaceholder is the string used to replace any
@@ -22,7 +22,7 @@ var ExpressionPlaceholder = "EXPR"
 // store the raw JavaScript source that is a required argument
 // for many tree-sitter functions.
 type Node struct {
-	node        *sitter.Node
+	node        *tree_sitter.Node
 	source      []byte
 	captureName string
 }
@@ -31,7 +31,7 @@ type Node struct {
 // node and a byte-slice containing the JavaScript source.
 // The source provided should be the complete source code
 // and not just the source for the node in question.
-func NewNode(n *sitter.Node, source []byte) *Node {
+func NewNode(n *tree_sitter.Node, source []byte) *Node {
 	return &Node{
 		node:   n,
 		source: source,
@@ -49,7 +49,7 @@ func (n *Node) Content() string {
 	if n.node == nil {
 		return ""
 	}
-	return n.node.Content(n.source)
+	return n.node.Utf8Text(n.source)
 }
 
 // Type returns the tree-sitter type string for a Node.
@@ -76,7 +76,7 @@ func (n *Node) Child(index int) *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.Child(index), n.source)
+	return NewNode(n.node.Child(uint(index)), n.source)
 }
 
 // NamedChild returns the 'named' child Node at the provided
@@ -89,7 +89,7 @@ func (n *Node) NamedChild(index int) *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.NamedChild(index), n.source)
+	return NewNode(n.node.NamedChild(uint(index)), n.source)
 }
 
 // ChildCount returns the number of children a node has
@@ -339,23 +339,43 @@ func (n *Node) IsNamed() bool {
 // ForEachChild iterates over a node's children in a depth-first
 // manner, calling the supplied function for each node
 func (n *Node) ForEachChild(fn func(*Node)) {
-	it := sitter.NewIterator(n.node, sitter.DFSMode)
-
-	it.ForEach(func(sn *sitter.Node) error {
-		fn(NewNode(sn, n.source))
-		return nil
-	})
+	if !n.IsValid() {
+		return
+	}
+	
+	var walk func(*tree_sitter.Node)
+	walk = func(node *tree_sitter.Node) {
+		if node == nil {
+			return
+		}
+		fn(NewNode(node, n.source))
+		for i := uint(0); i < node.ChildCount(); i++ {
+			walk(node.Child(i))
+		}
+	}
+	walk(n.node)
 }
 
 // ForEachNamedChild iterates over a node's named children in a
 // depth-first manner, calling the supplied function for each node
 func (n *Node) ForEachNamedChild(fn func(*Node)) {
-	it := sitter.NewNamedIterator(n.node, sitter.DFSMode)
-
-	it.ForEach(func(sn *sitter.Node) error {
-		fn(NewNode(sn, n.source))
-		return nil
-	})
+	if !n.IsValid() {
+		return
+	}
+	
+	var walk func(*tree_sitter.Node)
+	walk = func(node *tree_sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node.IsNamed() {
+			fn(NewNode(node, n.source))
+		}
+		for i := uint(0); i < node.ChildCount(); i++ {
+			walk(node.Child(i))
+		}
+	}
+	walk(n.node)
 }
 
 // Format outputs a nicely formatted version of the source code for the
@@ -429,32 +449,30 @@ func (n *Node) QueryMulti(query string, fn func(QueryResult)) {
 	if !n.IsValid() {
 		return
 	}
-	q, err := sitter.NewQuery(
-		[]byte(query),
-		javascript.GetLanguage(),
-	)
+	
+	language := tree_sitter.NewLanguage(tree_sitter_javascript.Language())
+	q, err := tree_sitter.NewQuery(language, query)
 	if err != nil {
 		return
 	}
+	defer q.Close()
 
-	qc := sitter.NewQueryCursor()
+	qc := tree_sitter.NewQueryCursor()
 	defer qc.Close()
 
 	qc.Exec(q, n.node)
 
 	for {
-		match, exists := qc.NextMatch()
-		if !exists || match == nil {
+		match, ok := qc.NextMatch()
+		if !ok {
 			break
 		}
-
-		match = qc.FilterPredicates(match, n.source)
 
 		qr := NewQueryResult()
 
 		for _, capture := range match.Captures {
 			node := NewNode(capture.Node, n.source)
-			node.captureName = q.CaptureNameForId(capture.Index)
+			node.captureName = q.CaptureNames()[capture.Index]
 			qr.Add(node)
 		}
 		if len(qr) == 0 {
@@ -493,25 +511,33 @@ func (n *Node) CaptureName() string {
 
 // dequote removes surround quotes from the provided string
 func dequote(in string) string {
-	return strings.Trim(in, "'\"`")
+	return strings.Trim(in, "'\"` ")
 }
 
 // content returns the source for the provided tree-sitter
 // node, checking if the node is nil first.
-func content(n *sitter.Node, source []byte) string {
+func content(n *tree_sitter.Node, source []byte) string {
 	if n == nil {
 		return ""
 	}
-	return n.Content(source)
+	return n.Utf8Text(source)
 }
 
 // PrintTree returns a string representation of the syntax tree
 // for the provided JavaScript source
 func PrintTree(source []byte) string {
-	parser := sitter.NewParser()
-	parser.SetLanguage(javascript.GetLanguage())
+	parser := tree_sitter.NewParser()
+	defer parser.Close()
+	
+	language := tree_sitter.NewLanguage(tree_sitter_javascript.Language())
+	parser.SetLanguage(language)
 
-	tree := parser.Parse(nil, source)
+	tree, err := parser.Parse(source, nil)
+	if err != nil || tree == nil {
+		return ""
+	}
+	defer tree.Close()
+	
 	root := tree.RootNode()
 
 	return getTree(root, source)
@@ -519,28 +545,28 @@ func PrintTree(source []byte) string {
 
 // getTree does the actual heavy lifting and recursion for PrintTree
 // TODO: provide a way to print the tree as a JSON object?
-func getTree(n *sitter.Node, source []byte) string {
+func getTree(n *tree_sitter.Node, source []byte) string {
 
 	out := &strings.Builder{}
 
-	c := sitter.NewTreeCursor(n)
+	c := tree_sitter.NewTreeCursor(n)
 	defer c.Close()
 
 	// walkies
 	depth := 0
 	recurse := true
 	for {
-		if recurse && c.CurrentNode().IsNamed() {
-			fieldName := c.CurrentFieldName()
+		if recurse && c.Node().IsNamed() {
+			fieldName := c.FieldName()
 			if fieldName != "" {
 				fieldName += ": "
 			}
 
 			contentStr := ""
-			if c.CurrentNode().ChildCount() == 0 || c.CurrentNode().Type() == "string" {
-				contentStr = fmt.Sprintf(" (%s)", content(c.CurrentNode(), source))
+			if c.Node().ChildCount() == 0 || c.Node().Type() == "string" {
+				contentStr = fmt.Sprintf(" (%s)", content(c.Node(), source))
 			}
-			fmt.Fprintf(out, "%s%s%s%s\n", strings.Repeat("  ", depth), fieldName, c.CurrentNode().Type(), contentStr)
+			fmt.Fprintf(out, "%s%s%s%s\n", strings.Repeat("  ", depth), fieldName, c.Node().Type(), contentStr)
 		}
 
 		// descend into the tree
